@@ -1,7 +1,7 @@
 import udp from "@SignalRGB/udp";
 
 export function Name() { return "LIFX"; }
-export function Version() { return "0.1.0"; }
+export function Version() { return "0.1.1"; }
 export function Type() { return "network"; }
 export function DeviceType() { return "wifi"; }
 export function Publisher() { return "BigChiefRick"; }
@@ -48,6 +48,7 @@ const MESSAGE = Object.freeze({
 
 let sequence = 0;
 let deviceSocket;
+let deviceSocketReady = false;
 let lastColorSignature = "";
 let lastColorSentAt = 0;
 let lastSocketErrorAt = 0;
@@ -65,20 +66,29 @@ export function Initialize() {
 	device.addFeature("udp");
 
 	deviceSocket = udp.createSocket();
+	deviceSocketReady = false;
+	deviceSocket.on("connected", function() {
+		deviceSocketReady = true;
+		device.log(`LIFX UDP connected to ${controller.ip}:${LIFX_PORT}.`);
+		if (powerOnWhenLinked) {
+			sendToController(buildSetPower(true, 0));
+		}
+	});
 	deviceSocket.on("error", function(code, message) {
 		logSocketError(code, message);
 	});
-	deviceSocket.bind(0);
+	deviceSocket.connect(controller.ip, LIFX_PORT);
 
 	lastColorSignature = "";
 	lastColorSentAt = 0;
-
-	if (powerOnWhenLinked) {
-		sendToController(buildSetPower(controller.target, true, 0));
-	}
 }
 
 export function Render() {
+	if (!deviceSocketReady) {
+		device.pause(MAX_SEND_RATE_MS);
+		return;
+	}
+
 	const now = Date.now();
 	if (now - lastColorSentAt < MAX_SEND_RATE_MS) {
 		device.pause(MAX_SEND_RATE_MS - (now - lastColorSentAt));
@@ -91,7 +101,7 @@ export function Render() {
 	const signature = `${rgb[0]},${rgb[1]},${rgb[2]},${transitionMs}`;
 
 	if (signature !== lastColorSignature || now - lastColorSentAt >= COLOR_REASSERT_MS) {
-		sendToController(buildSetColor(controller.target, rgb, Number(transitionMs), DEFAULT_KELVIN));
+		sendToController(buildSetColor(rgb, Number(transitionMs), DEFAULT_KELVIN));
 		lastColorSignature = signature;
 		lastColorSentAt = now;
 	}
@@ -100,23 +110,24 @@ export function Render() {
 }
 
 export function Shutdown() {
-	if (turnOffOnShutdown && deviceSocket) {
-		sendToController(buildSetPower(controller.target, false, 0));
+	if (turnOffOnShutdown && deviceSocketReady) {
+		sendToController(buildSetPower(false, 0));
 	}
 
 	if (deviceSocket) {
 		deviceSocket.close();
 		deviceSocket = undefined;
+		deviceSocketReady = false;
 	}
 }
 
 function sendToController(packet) {
-	if (!deviceSocket) {
+	if (!deviceSocket || !deviceSocketReady) {
 		return;
 	}
 
 	try {
-		deviceSocket.write(packet, controller.ip, Number(controller.port || LIFX_PORT));
+		deviceSocket.send(packet);
 	} catch (error) {
 		logSocketError("send", error);
 	}
@@ -212,19 +223,19 @@ function buildGetService() {
 	return buildPacket(MESSAGE.GET_SERVICE, [], [], true, true);
 }
 
-function buildGetLabel(target) {
-	return buildPacket(MESSAGE.GET_LABEL, target, [], false, true);
+function buildGetLabel() {
+	return buildPacket(MESSAGE.GET_LABEL, [], [], true, true);
 }
 
-function buildGetVersion(target) {
-	return buildPacket(MESSAGE.GET_VERSION, target, [], false, true);
+function buildGetVersion() {
+	return buildPacket(MESSAGE.GET_VERSION, [], [], true, true);
 }
 
-function buildSetPower(target, on, duration) {
+function buildSetPower(on, duration) {
 	const payload = new Array(6).fill(0);
 	putUint16LE(payload, 0, on ? 0xffff : 0);
 	putUint32LE(payload, 2, Math.max(0, Number(duration) || 0));
-	return buildPacket(MESSAGE.SET_POWER, target, payload, false, false);
+	return buildPacket(MESSAGE.SET_POWER, [], payload, true, false);
 }
 
 function rgbToHsbk(rgb, kelvin) {
@@ -258,7 +269,7 @@ function rgbToHsbk(rgb, kelvin) {
 	};
 }
 
-function buildSetColor(target, rgb, duration, kelvin) {
+function buildSetColor(rgb, duration, kelvin) {
 	const hsbk = rgbToHsbk(rgb, kelvin);
 	const payload = new Array(13).fill(0);
 	putUint16LE(payload, 1, hsbk.hue);
@@ -266,7 +277,7 @@ function buildSetColor(target, rgb, duration, kelvin) {
 	putUint16LE(payload, 5, hsbk.brightness);
 	putUint16LE(payload, 7, hsbk.kelvin);
 	putUint32LE(payload, 9, Math.max(0, Number(duration) || 0));
-	return buildPacket(MESSAGE.SET_COLOR, target, payload, false, false);
+	return buildPacket(MESSAGE.SET_COLOR, [], payload, true, false);
 }
 
 function normalizeBytes(value) {
@@ -353,6 +364,14 @@ function remoteIp(value, fallback) {
 	return fallback;
 }
 
+function controllerIdForIp(ipAddress) {
+	const ip = String(ipAddress || "").trim();
+	if (!/^((25[0-5]|2[0-4]\d|1?\d?\d)(\.|$)){4}$/.test(ip)) {
+		return undefined;
+	}
+	return `lifx-${ip.replace(/\./g, "-")}`;
+}
+
 export function DiscoveryService() {
 	this.IconUrl = "";
 	this.UdpBroadcastAddress = "255.255.255.255";
@@ -363,6 +382,8 @@ export function DiscoveryService() {
 	this.firstRun = true;
 	this.socket = undefined;
 	this.cache = new DeviceCache();
+	this.controllers = new Map();
+	this.announcedControllers = new Set();
 
 	this.Initialize = function() {
 		service.log("Initializing LIFX LAN discovery on UDP 56700.");
@@ -422,30 +443,33 @@ export function DiscoveryService() {
 
 	this.handleIncoming = function(value) {
 		const packet = parsePacket(value);
-		if (!packet || packet.id === "000000000000") {
+		if (!packet) {
 			return;
 		}
 
-		const existing = this.cache.Get(packet.id) || {};
-		const controller = service.getController(packet.id);
-		const ip = remoteIp(value, existing.ip || (controller && controller.ip));
+		const ip = remoteIp(value);
+		const id = controllerIdForIp(ip);
+		if (!id) {
+			return;
+		}
+
+		const existing = this.cache.Get(id) || {};
+		const controller = this.getController(id);
 
 		if (packet.type === MESSAGE.STATE_SERVICE) {
-			const port = packet.bytes.length >= 41 ? getUint32LE(packet.bytes, 37) : LIFX_PORT;
 			const data = {
-				id: packet.id,
-				target: packet.target,
+				id,
 				ip,
-				port: port || LIFX_PORT,
-				name: existing.name || `LIFX ${packet.id.slice(-6)}`,
+				port: LIFX_PORT,
+				name: existing.name || `LIFX ${ip}`,
 				vendor: existing.vendor,
 				product: existing.product,
 				model: existing.model || "LIFX Light",
 				paired: existing.paired === true,
 			};
 			this.upsertController(data);
-			this.socket.write(buildGetLabel(packet.target), ip, data.port);
-			this.socket.write(buildGetVersion(packet.target), ip, data.port);
+			this.socket.write(buildGetLabel(), ip, LIFX_PORT);
+			this.socket.write(buildGetVersion(), ip, LIFX_PORT);
 			return;
 		}
 
@@ -454,9 +478,9 @@ export function DiscoveryService() {
 		}
 
 		const data = Object.assign({}, existing, controller || {}, {
-			id: packet.id,
-			target: packet.target,
+			id,
 			ip,
+			port: LIFX_PORT,
 		});
 
 		if (packet.type === MESSAGE.STATE_LABEL && packet.bytes.length >= 68) {
@@ -471,8 +495,12 @@ export function DiscoveryService() {
 		this.upsertController(data);
 	};
 
+	this.getController = function(id) {
+		return this.controllers.get(id) || service.getController(id);
+	};
+
 	this.upsertController = function(value) {
-		let controller = service.getController(value.id);
+		let controller = this.getController(value.id);
 		if (!controller) {
 			controller = new LifxController(value);
 			service.addController(controller);
@@ -480,15 +508,38 @@ export function DiscoveryService() {
 			controller.updateWithValue(value);
 		}
 
+		this.controllers.set(value.id, controller);
 		this.cacheController(controller);
-		if (controller.paired) {
-			service.announceController(controller);
+		return controller;
+	};
+
+	this.announceOnce = function(controller) {
+		if (!controller || !controller.paired || this.announcedControllers.has(controller.id)) {
+			return;
 		}
+		service.announceController(controller);
+		this.announcedControllers.add(controller.id);
 	};
 
 	this.loadCachedDevices = function() {
-		for (const [, value] of this.cache.Entries()) {
-			this.upsertController(value);
+		for (const [cachedId, cachedValue] of Array.from(this.cache.Entries())) {
+			const value = Object.assign({}, cachedValue);
+			const migratedId = controllerIdForIp(value.ip);
+			if (!migratedId) {
+				continue;
+			}
+			if (cachedId !== migratedId) {
+				const legacyController = service.getController(cachedId);
+				if (legacyController) {
+					service.suppressController(legacyController);
+					service.removeController(legacyController);
+				}
+				this.cache.Remove(cachedId);
+				value.id = migratedId;
+				value.port = LIFX_PORT;
+			}
+			const controller = this.upsertController(value);
+			this.announceOnce(controller);
 			if (value.ip) {
 				this.checkIP(value.ip);
 			}
@@ -496,24 +547,25 @@ export function DiscoveryService() {
 	};
 
 	this.link = function(controllerObject) {
-		const controller = service.getController(controllerObject.id);
+		const controller = this.getController(controllerObject.id);
 		if (!controller) {
 			return;
 		}
 		controller.paired = true;
 		service.updateController(controller);
-		service.announceController(controller);
+		this.announceOnce(controller);
 		this.cacheController(controller);
 	};
 
 	this.unlink = function(controllerObject) {
-		const controller = service.getController(controllerObject.id);
+		const controller = this.getController(controllerObject.id);
 		if (!controller) {
 			return;
 		}
 		controller.paired = false;
 		service.updateController(controller);
 		service.suppressController(controller);
+		this.announcedControllers.delete(controller.id);
 		this.cacheController(controller);
 	};
 
@@ -521,11 +573,13 @@ export function DiscoveryService() {
 		if (!controllerObject) {
 			return;
 		}
-		const controller = service.getController(controllerObject.id);
+		const controller = this.getController(controllerObject.id);
 		if (controller) {
 			service.suppressController(controller);
 			service.removeController(controller);
 		}
+		this.controllers.delete(controllerObject.id);
+		this.announcedControllers.delete(controllerObject.id);
 		this.cache.Remove(controllerObject.id);
 	};
 
@@ -536,9 +590,8 @@ export function DiscoveryService() {
 	this.cacheController = function(value) {
 		this.cache.Add(value.id, {
 			id: value.id,
-			target: normalizeTarget(value.target),
 			ip: value.ip,
-			port: Number(value.port || LIFX_PORT),
+			port: LIFX_PORT,
 			name: value.name,
 			vendor: value.vendor,
 			product: value.product,
@@ -551,10 +604,9 @@ export function DiscoveryService() {
 class LifxController {
 	constructor(value) {
 		this.id = value.id;
-		this.target = normalizeTarget(value.target || value.id);
 		this.ip = value.ip;
-		this.port = Number(value.port || LIFX_PORT);
-		this.name = value.name || `LIFX ${value.id.slice(-6)}`;
+		this.port = LIFX_PORT;
+		this.name = value.name || `LIFX ${value.ip}`;
 		this.vendor = value.vendor;
 		this.product = value.product;
 		this.model = value.model || productName(value.product);
@@ -562,9 +614,8 @@ class LifxController {
 	}
 
 	updateWithValue(value) {
-		this.target = normalizeTarget(value.target || this.target);
 		this.ip = value.ip || this.ip;
-		this.port = Number(value.port || this.port || LIFX_PORT);
+		this.port = LIFX_PORT;
 		this.name = value.name || this.name;
 		this.vendor = value.vendor === undefined ? this.vendor : value.vendor;
 		this.product = value.product === undefined ? this.product : value.product;

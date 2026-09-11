@@ -7,6 +7,8 @@ const source = fs.readFileSync(new URL("../LIFX.js", import.meta.url), "utf8")
 	.replace(/^import udp from "@SignalRGB\/udp";\s*/m, "")
 	.replace(/\bexport\s+/g, "");
 
+const controllers = new Map();
+const announcedControllers = [];
 const context = vm.createContext({
 	Array,
 	Date,
@@ -19,12 +21,27 @@ const context = vm.createContext({
 	decodeURIComponent,
 	parseInt,
 	service: {
+		addController: (controller) => controllers.set(controller.id, controller),
+		announceController: (controller) => announcedControllers.push(controller.id),
+		getController: (id) => controllers.get(id),
 		getSetting: () => undefined,
 		log: () => {},
+		removeController: (controller) => controllers.delete(controller.id),
+		removeSetting: () => {},
+		saveSetting: () => {},
+		suppressController: () => {},
+		updateController: () => {},
+	},
+	udp: {
+		createSocket: () => ({
+			bind: () => {},
+			on: () => {},
+			write: () => {},
+		}),
 	},
 });
 
-vm.runInContext(`${source}\nthis.protocol = { MESSAGE, buildGetService, buildGetLabel, buildSetColor, buildSetPower, getUint16LE, getUint32LE, normalizeTarget, parsePacket, readLabel, rgbToHsbk, targetId };`, context);
+vm.runInContext(`${source}\nthis.protocol = { DiscoveryService, MESSAGE, buildGetService, buildGetLabel, buildGetVersion, buildSetColor, buildSetPower, controllerIdForIp, getUint16LE, getUint32LE, normalizeTarget, parsePacket, readLabel, rgbToHsbk, targetId };`, context);
 const protocol = context.protocol;
 
 test("builds a tagged GetService packet", () => {
@@ -62,11 +79,10 @@ test("converts RGB primary colors and black to LIFX HSBK", () => {
 });
 
 test("builds SetColor with the documented payload layout", () => {
-	const target = protocol.normalizeTarget("d0:73:d5:00:11:22");
-	const packet = protocol.buildSetColor(target, [255, 0, 0], 50, 3500);
+	const packet = protocol.buildSetColor([255, 0, 0], 50, 3500);
 	assert.equal(packet.length, 49);
-	assert.equal(protocol.getUint16LE(packet, 2), 0x1400);
-	assert.deepEqual(Array.from(packet.slice(8, 16)), Array.from(target));
+	assert.equal(protocol.getUint16LE(packet, 2), 0x3400);
+	assert.deepEqual(Array.from(packet.slice(8, 16)), new Array(8).fill(0));
 	assert.equal(protocol.getUint16LE(packet, 32), protocol.MESSAGE.SET_COLOR);
 	assert.equal(protocol.getUint16LE(packet, 37), 0);
 	assert.equal(protocol.getUint16LE(packet, 39), 65535);
@@ -76,16 +92,56 @@ test("builds SetColor with the documented payload layout", () => {
 });
 
 test("builds SetPower without requesting a response", () => {
-	const packet = protocol.buildSetPower("d073d5001122", true, 250);
+	const packet = protocol.buildSetPower(true, 250);
 	assert.equal(packet.length, 42);
+	assert.equal(protocol.getUint16LE(packet, 2), 0x3400);
+	assert.deepEqual(Array.from(packet.slice(8, 16)), new Array(8).fill(0));
 	assert.equal(packet[22], 0);
 	assert.equal(protocol.getUint16LE(packet, 32), protocol.MESSAGE.SET_POWER);
 	assert.equal(protocol.getUint16LE(packet, 36), 65535);
 	assert.equal(protocol.getUint32LE(packet, 38), 250);
 });
 
+test("builds tagged wildcard metadata requests for unicast discovery follow-up", () => {
+	for (const packet of [protocol.buildGetLabel(), protocol.buildGetVersion()]) {
+		assert.equal(protocol.getUint16LE(packet, 2), 0x3400);
+		assert.deepEqual(Array.from(packet.slice(8, 16)), new Array(8).fill(0));
+		assert.equal(packet[22], 1);
+	}
+});
+
+test("creates a stable SignalRGB controller id from the responder IPv4 address", () => {
+	assert.equal(protocol.controllerIdForIp("192.168.1.42"), "lifx-192-168-1-42");
+	assert.equal(protocol.controllerIdForIp("not-an-ip"), undefined);
+});
+
+test("repeated discovery updates add and announce one controller on fixed port 56700", () => {
+	controllers.clear();
+	announcedControllers.length = 0;
+	const discovery = new protocol.DiscoveryService();
+	discovery.startSocket();
+	const packet = protocol.buildGetService();
+	packet.splice(8, 8, ...protocol.normalizeTarget("d073d5001122"));
+	packet[32] = protocol.MESSAGE.STATE_SERVICE;
+	packet[33] = 0;
+	packet.push(1, 0x7c, 0xfd, 0x00, 0x00);
+	packet[0] = packet.length;
+	packet[1] = 0;
+	const response = {response: packet.join(","), ip: "192.168.1.42"};
+
+	discovery.handleIncoming(response);
+	discovery.link({id: "lifx-192-168-1-42"});
+	discovery.handleIncoming(response);
+	discovery.handleIncoming(response);
+
+	assert.equal(controllers.size, 1);
+	assert.equal(controllers.get("lifx-192-168-1-42").port, 56700);
+	assert.deepEqual(announcedControllers, ["lifx-192-168-1-42"]);
+});
+
 test("parses StateService packets from arrays and comma strings", () => {
-	const packet = protocol.buildGetLabel("d073d5001122");
+	const packet = protocol.buildGetService();
+	packet.splice(8, 8, ...protocol.normalizeTarget("d073d5001122"));
 	packet[32] = protocol.MESSAGE.STATE_SERVICE;
 	packet[33] = 0;
 	packet.push(1, 0x7c, 0xdd, 0x00, 0x00);

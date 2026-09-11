@@ -6,14 +6,17 @@ A SignalRGB network add-on that discovers and controls LIFX lights directly over
 
 ## Current status
 
-Version `0.1.0` is the first hardware-test release.
+Version `0.1.1` is the current hardware-test release.
 
 - Local LAN control only; no LIFX cloud account or API token.
 - Automatic UDP discovery on port `56700`.
 - Manual IPv4 fallback when broadcast discovery is blocked.
 - Standard single-zone color lights render as one SignalRGB canvas point.
 - Color updates are capped at 20 packets per second, matching LIFX's published limit.
+- Controllers are keyed by responder IP because SignalRGB's discovery-service text boundary does not preserve arbitrary binary address bytes. Reserve each bulb's DHCP address for a stable SignalRGB device identity.
 - LIFX multizone strips, Beam, Candle, Tile, and matrix products currently render as one color for the entire device. Per-zone support is planned separately.
+
+Version `0.1.1` fixes duplicate device announcements and sends wildcard-target LIFX packets to the responder IP on the fixed LAN protocol port `56700`. It also migrates the malformed cache produced by `0.1.0` during the next SignalRGB restart.
 
 The protocol packet builder has automated tests. Live discovery and color output still need validation inside SignalRGB on real hardware before this should be called a stable release.
 
