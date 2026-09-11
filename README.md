@@ -2,7 +2,7 @@
 
 A SignalRGB network add-on that discovers and controls LIFX lights directly over the local network. Each linked light appears as a one-pixel device in the SignalRGB layout and follows the active canvas effect.
 
-[![Add to My SignalRGB Installation](https://marketplace.signalrgb.com/resources/add-extension-256.png "Add to My SignalRGB Installation")](signalrgb://addon/install?url=https://github.com/BigChiefRick/SignalRGB-LIFX)
+[![Add to My SignalRGB Installation](https://marketplace.signalrgb.com/resources/add-extension-256.png "Add to My SignalRGB Installation")](https://srgbmods.net/s?p=addon/install?url=https://github.com/BigChiefRick/SignalRGB-LIFX)
 
 ## Current status
 
@@ -27,6 +27,8 @@ The protocol packet builder has automated tests. Live discovery and color output
 3. Open the LIFX add-on page in SignalRGB.
 4. Select **Link** next to each discovered light.
 5. Move each LIFX device to the desired position on the SignalRGB layout canvas.
+
+GitHub does not activate custom application protocols directly from README links, so the button uses the HTTPS redirect provided by SRGBmods. The redirect opens `signalrgb://addon/install?url=https://github.com/BigChiefRick/SignalRGB-LIFX` locally; it does not replace or repackage the repository.
 
 If a light is not discovered, confirm the PC and light are on the same LAN, disconnect any VPN that captures local broadcast traffic, or enter the light's IPv4 address and select **Check IP**.
 
