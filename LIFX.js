@@ -1,7 +1,7 @@
 import udp from "@SignalRGB/udp";
 
 export function Name() { return "LIFX"; }
-export function Version() { return "0.1.1"; }
+export function Version() { return "0.1.2"; }
 export function Type() { return "network"; }
 export function DeviceType() { return "wifi"; }
 export function Publisher() { return "BigChiefRick"; }
@@ -67,7 +67,7 @@ export function Initialize() {
 
 	deviceSocket = udp.createSocket();
 	deviceSocketReady = false;
-	deviceSocket.on("connected", function() {
+	deviceSocket.on("connection", function() {
 		deviceSocketReady = true;
 		device.log(`LIFX UDP connected to ${controller.ip}:${LIFX_PORT}.`);
 		if (powerOnWhenLinked) {

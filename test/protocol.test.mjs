@@ -44,6 +44,55 @@ const context = vm.createContext({
 vm.runInContext(`${source}\nthis.protocol = { DiscoveryService, MESSAGE, buildGetService, buildGetLabel, buildGetVersion, buildSetColor, buildSetPower, controllerIdForIp, getUint16LE, getUint32LE, normalizeTarget, parsePacket, readLabel, rgbToHsbk, targetId };`, context);
 const protocol = context.protocol;
 
+function createRuntimeHarness() {
+	const sockets = [];
+	const logs = [];
+	const runtimeContext = vm.createContext({
+		Array,
+		Date,
+		JSON,
+		Map,
+		Math,
+		Number,
+		Object,
+		String,
+		decodeURIComponent,
+		parseInt,
+		controller: {ip: "192.0.2.10", name: "Test LIFX"},
+		device: {
+			addFeature: () => {},
+			color: () => [12, 34, 56],
+			createColorArray: () => [12, 34, 56],
+			log: (message) => logs.push(message),
+			pause: () => {},
+			setName: () => {},
+		},
+		forcedColor: "#0c2238",
+		LightingMode: "Canvas",
+		powerOnWhenLinked: false,
+		transitionMs: 50,
+		turnOffOnShutdown: false,
+		udp: {
+			createSocket: () => {
+				const socket = {
+					connectedTo: undefined,
+					handlers: {},
+					sent: [],
+					close: () => {},
+					connect: (ip, port) => { socket.connectedTo = {ip, port}; },
+					on: (event, callback) => { socket.handlers[event] = callback; },
+					send: (packet) => socket.sent.push(packet),
+				};
+				sockets.push(socket);
+				return socket;
+			},
+		},
+	});
+
+	vm.runInContext(`${source}\nthis.runtime = { Initialize, Render, Shutdown };`, runtimeContext);
+	return {logs, runtime: runtimeContext.runtime, sockets};
+}
+
 test("builds a tagged GetService packet", () => {
 	const packet = protocol.buildGetService();
 	assert.equal(packet.length, 36);
@@ -52,6 +101,24 @@ test("builds a tagged GetService packet", () => {
 	assert.equal(packet[22], 1);
 	assert.equal(protocol.getUint16LE(packet, 32), protocol.MESSAGE.GET_SERVICE);
 	assert.deepEqual(packet.slice(8, 16), new Array(8).fill(0));
+});
+
+test("starts canvas rendering from SignalRGB's connection callback", () => {
+	const harness = createRuntimeHarness();
+	harness.runtime.Initialize();
+	const socket = harness.sockets[0];
+
+	assert.deepEqual(socket.connectedTo, {ip: "192.0.2.10", port: 56700});
+	assert.equal(typeof socket.handlers.connection, "function");
+	assert.equal(socket.handlers.connected, undefined);
+	harness.runtime.Render();
+	assert.equal(socket.sent.length, 0);
+
+	socket.handlers.connection();
+	harness.runtime.Render();
+	assert.equal(socket.sent.length, 1);
+	assert.equal(protocol.getUint16LE(socket.sent[0], 32), protocol.MESSAGE.SET_COLOR);
+	assert.match(harness.logs[0], /UDP connected/);
 });
 
 test("normalizes a LIFX serial into the eight-byte target", () => {
