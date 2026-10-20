@@ -291,18 +291,29 @@ function buildSetColor(rgb, duration, kelvin) {
 	return buildPacket(MESSAGE.SET_COLOR, [], payload, true, false);
 }
 
-function normalizeBytes(value) {
-	let raw = value;
-	if (raw && raw.response !== undefined) {
-		raw = raw.response;
-	}
-	if (raw && raw.data !== undefined) {
-		raw = raw.data;
+// Which field of the incoming datagram object actually carried intact bytes.
+// Recorded for the log so the choice is visible rather than mysterious.
+let lastByteSource = "";
+
+// Convert one candidate field into a byte array. No unwrapping here - the
+// caller decides which field to try.
+function bytesFromCandidate(raw) {
+	if (raw === undefined || raw === null) {
+		return [];
 	}
 	if (Array.isArray(raw)) {
 		return raw.map(function(byte) { return Number(byte) & 0xff; });
 	}
-	if (raw && typeof raw.length === "number" && typeof raw !== "string") {
+	// ArrayBuffer, or anything that quacks like one.
+	if (typeof raw === "object" && typeof raw.byteLength === "number" && typeof raw.length !== "number") {
+		try {
+			return Array.from(new Uint8Array(raw)).map(function(byte) { return byte & 0xff; });
+		} catch (error) {
+			return [];
+		}
+	}
+	// Typed arrays and other array-likes.
+	if (typeof raw === "object" && typeof raw.length === "number") {
 		return Array.from(raw).map(function(byte) { return Number(byte) & 0xff; });
 	}
 	if (typeof raw === "string") {
@@ -312,6 +323,64 @@ function normalizeBytes(value) {
 		return Array.from(raw).map(function(character) { return character.charCodeAt(0) & 0xff; });
 	}
 	return [];
+}
+
+// A LIFX packet declares its own length in its first two bytes, so we can tell
+// an intact copy from a mangled one. This matters because SignalRGB hands the
+// same datagram over in several forms, and `data` is a UTF-8 decoded string:
+// every byte above 0x7F becomes U+FFFD and multi-byte sequences collapse, so
+// the array comes up short and the packet gets rejected. Try each field and
+// keep the first one whose declared size actually fits.
+function isSelfConsistent(bytes) {
+	if (bytes.length < HEADER_SIZE) {
+		return false;
+	}
+	const declared = bytes[0] | (bytes[1] << 8);
+	return declared >= HEADER_SIZE && declared <= bytes.length;
+}
+
+function normalizeBytes(value) {
+	if (value && typeof value === "object" && !Array.isArray(value) && typeof value.length !== "number") {
+		const order = ["buffer", "utf16", "bytes", "payload", "data", "response"];
+		let best = [];
+		let bestKey = "";
+
+		for (const key of order) {
+			if (value[key] === undefined) {
+				continue;
+			}
+			const candidate = bytesFromCandidate(value[key]);
+			if (isSelfConsistent(candidate)) {
+				lastByteSource = key;
+				return candidate;
+			}
+			if (candidate.length > best.length) {
+				best = candidate;
+				bestKey = key;
+			}
+		}
+
+		// Nested wrappers, e.g. { response: { data: ... } }.
+		for (const key of ["response", "data"]) {
+			const inner = value[key];
+			if (inner && typeof inner === "object" && typeof inner.length !== "number") {
+				const candidate = normalizeBytes(inner);
+				if (isSelfConsistent(candidate)) {
+					return candidate;
+				}
+				if (candidate.length > best.length) {
+					best = candidate;
+					bestKey = `${key}.${lastByteSource}`;
+				}
+			}
+		}
+
+		lastByteSource = bestKey || "none";
+		return best;
+	}
+
+	lastByteSource = "raw";
+	return bytesFromCandidate(value);
 }
 
 // Diagnostic only: describe a datagram we could not parse, so we can tell
@@ -725,7 +794,7 @@ export function DiscoveryService() {
 
 		if (!seenResponders.has(ip)) {
 			seenResponders.add(ip);
-			service.log(`Reply from ${ip} (message type ${packet.type}).`);
+			service.log(`Reply from ${ip} (message type ${packet.type}, bytes read from "${lastByteSource}").`);
 		}
 
 		const existing = this.cache.Get(id) || {};
