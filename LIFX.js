@@ -314,6 +314,22 @@ function normalizeBytes(value) {
 	return [];
 }
 
+// Diagnostic only: describe a datagram we could not parse, so we can tell
+// junk traffic apart from a light replying in a shape we reject.
+function describeDatagram(value) {
+	const shape = value === null ? "null" : typeof value;
+	const keys = (value && typeof value === "object" && !Array.isArray(value))
+		? Object.keys(value).slice(0, 12).join("/")
+		: "-";
+	const bytes = normalizeBytes(value);
+	const hex = bytes.slice(0, 40)
+		.map(function(byte) { return byte.toString(16).padStart(2, "0"); })
+		.join(" ");
+	const declared = bytes.length >= 2 ? getUint16LE(bytes, 0) : -1;
+	const type = bytes.length >= 34 ? getUint16LE(bytes, 32) : -1;
+	return `from=${remoteIp(value) || "?"} shape=${shape} keys=${keys} bytes=${bytes.length} declaredSize=${declared} type=${type} head=[${hex}]`;
+}
+
 function parsePacket(value) {
 	const bytes = normalizeBytes(value);
 	if (bytes.length < HEADER_SIZE) {
@@ -472,9 +488,22 @@ export function DiscoveryService() {
 	};
 
 	this.handleSocketError = function(label, code, message) {
-		// Windows turns an ICMP "port unreachable" from a swept address into
-		// WSAECONNRESET on the sending UDP socket, and that socket often stops
-		// delivering datagrams afterwards. Rebuild it instead of going deaf.
+		const text = `${code}${message ? ` ${message}` : ""}`;
+
+		// A reset here is just ICMP blowback from an address with nothing on
+		// it. The socket is still usable, and tearing it down was actively
+		// harmful: the replacement binds a new port, so every reply already in
+		// flight gets delivered to a port nobody is listening on. That is what
+		// was swallowing the bulbs. Log it and carry on.
+		if (/reset/i.test(text)) {
+			const seen = Date.now();
+			if (seen - lastDiscoveryErrorAt >= 15000) {
+				lastDiscoveryErrorAt = seen;
+				service.log(`LIFX ${label} socket: ${text} (expected during a sweep, socket kept open)`);
+			}
+			return;
+		}
+
 		if (label === "prober") {
 			if (this.probeSocket) {
 				try { this.probeSocket.close(); } catch (error) { /* already gone */ }
@@ -488,7 +517,7 @@ export function DiscoveryService() {
 		const now = Date.now();
 		if (now - lastDiscoveryErrorAt >= 5000) {
 			lastDiscoveryErrorAt = now;
-			service.log(`LIFX ${label} socket: ${code}${message ? ` - ${message}` : ""} (rebuilding, this is normal during a sweep)`);
+			service.log(`LIFX ${label} socket: ${text} (rebuilding)`);
 		}
 	};
 
@@ -635,6 +664,16 @@ export function DiscoveryService() {
 	this.checkIP = function(ipAddress) {
 		const raw = String(ipAddress || "").trim();
 
+		// Accept several addresses at once, separated by commas or spaces, so a
+		// list copied out of a router's DHCP table can be pasted straight in.
+		if (/[,\s]/.test(raw)) {
+			const parts = raw.split(/[,\s]+/).filter(function(part) { return part.length; });
+			for (const part of parts) {
+				this.checkIP(part);
+			}
+			return;
+		}
+
 		// Accept a bare 3-octet prefix ("192.168.0") as a subnet sweep request.
 		if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.?$/.test(raw)) {
 			this.sweepSubnet(raw.replace(/\.$/, ""));
@@ -662,7 +701,9 @@ export function DiscoveryService() {
 			// it means the socket can hear, which is a different problem from
 			// hearing nothing at all.
 			unparsedMessages++;
-			if (unparsedMessages <= 3 || unparsedMessages % 100 === 0) {
+			if (unparsedMessages <= 8) {
+				service.log(`Unparsed datagram #${unparsedMessages}: ${describeDatagram(value)}`);
+			} else if (unparsedMessages % 100 === 0) {
 				service.log(`Heard a datagram that did not parse as LIFX (${unparsedMessages} so far).`);
 			}
 			return;
