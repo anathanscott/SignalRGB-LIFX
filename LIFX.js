@@ -54,6 +54,15 @@ let lastColorSignature = "";
 let lastColorSentAt = 0;
 let lastSocketErrorAt = 0;
 
+// Discovery state lives at module scope. SignalRGB can rebuild the discovery
+// object underneath us, and anything stored on `this` silently resets when it
+// does - which showed up as the startup sweep running over and over.
+const SWEEP_CHUNK = 24;
+let sweepQueue = [];
+let discoveryFirstRun = true;
+let lastPollTime = 0;
+let lastDiscoveryErrorAt = 0;
+
 export function ledNames() {
 	return ["Light"];
 }
@@ -421,56 +430,136 @@ export function DiscoveryService() {
 		this.startSocket();
 	};
 
-	this.startSocket = function() {
-		if (this.socket) {
-			return;
-		}
-		this.socket = udp.createSocket();
-		this.socket.on("message", function(message) {
+	this.makeSocket = function(label) {
+		const socket = udp.createSocket();
+		socket.on("message", function(message) {
 			discovery.handleIncoming(message);
 		});
-		this.socket.on("error", function(code, message) {
-			service.log(`LIFX discovery UDP error: ${code}${message ? ` - ${message}` : ""}`);
+		socket.on("error", function(code, message) {
+			discovery.handleSocketError(label, code, message);
 		});
-		this.socket.bind(0);
+		socket.bind(0);
+		return socket;
+	};
+
+	this.startSocket = function() {
+		// Two sockets on purpose. The listener handles broadcasts and replies
+		// from lights we already know. The prober does the subnet sweep, so the
+		// ICMP blowback from empty addresses lands on a socket we can throw away
+		// without losing the lights that are working.
+		if (!this.socket) {
+			this.socket = this.makeSocket("listener");
+		}
+		if (!this.probeSocket) {
+			this.probeSocket = this.makeSocket("prober");
+		}
+	};
+
+	// Any socket can now be torn down and rebuilt mid-flight, so never touch
+	// one directly - this re-creates whatever is missing first.
+	this.writeListener = function(packet, ip, port) {
+		this.startSocket();
+		if (!this.socket) {
+			return;
+		}
+		try {
+			this.socket.write(packet, ip, port || LIFX_PORT);
+		} catch (error) {
+			this.handleSocketError("listener", "write", error);
+		}
+	};
+
+	this.handleSocketError = function(label, code, message) {
+		// Windows turns an ICMP "port unreachable" from a swept address into
+		// WSAECONNRESET on the sending UDP socket, and that socket often stops
+		// delivering datagrams afterwards. Rebuild it instead of going deaf.
+		if (label === "prober") {
+			if (this.probeSocket) {
+				try { this.probeSocket.close(); } catch (error) { /* already gone */ }
+				this.probeSocket = undefined;
+			}
+		} else if (this.socket) {
+			try { this.socket.close(); } catch (error) { /* already gone */ }
+			this.socket = undefined;
+		}
+
+		const now = Date.now();
+		if (now - lastDiscoveryErrorAt >= 5000) {
+			lastDiscoveryErrorAt = now;
+			service.log(`LIFX ${label} socket: ${code}${message ? ` - ${message}` : ""} (rebuilding, this is normal during a sweep)`);
+		}
 	};
 
 	this.Update = function() {
-		if (this.firstRun) {
+		if (discoveryFirstRun) {
+			discoveryFirstRun = false;
 			this.loadCachedDevices();
-			this.firstRun = false;
 			this.scanNow();
 			// Broadcast is unreliable on machines with a VPN or virtual adapter,
-			// so do one unicast sweep of every known subnet at startup. Unicast
-			// routes per-packet and reaches lights broadcast never finds.
+			// so queue one unicast sweep of every known subnet at startup.
 			this.sweepSubnet("");
 			return;
 		}
-		if (Date.now() - this.lastPollTime >= this.PollInterval) {
+
+		this.drainSweepQueue();
+
+		if (Date.now() - lastPollTime >= this.PollInterval) {
 			this.scanNow();
+		}
+	};
+
+	// The sweep goes out a few probes at a time rather than 254 at once. A
+	// single burst triggers a storm of ICMP replies that kills the socket
+	// before any light has had a chance to answer.
+	this.drainSweepQueue = function() {
+		if (!sweepQueue.length) {
+			return;
+		}
+
+		this.startSocket();
+		const packet = buildGetService();
+		const count = Math.min(SWEEP_CHUNK, sweepQueue.length);
+
+		for (let index = 0; index < count; index++) {
+			const address = sweepQueue.shift();
+			if (!this.probeSocket) {
+				break;
+			}
+			try {
+				this.probeSocket.write(packet, address, LIFX_PORT);
+			} catch (error) {
+				// Put the address back and rebuild - the next tick retries it.
+				sweepQueue.unshift(address);
+				this.handleSocketError("prober", "write", error);
+				break;
+			}
+		}
+
+		if (!sweepQueue.length) {
+			service.log("Subnet sweep finished.");
 		}
 	};
 
 	this.scanNow = function() {
 		this.startSocket();
-		this.lastPollTime = Date.now();
+		lastPollTime = Date.now();
 
 		const packet = buildGetService();
 
 		service.log("Broadcasting LIFX GetService discovery packet.");
-		this.socket.write(packet, this.UdpBroadcastAddress, this.UdpBroadcastPort);
+		this.writeListener(packet, this.UdpBroadcastAddress, this.UdpBroadcastPort);
 
 		// Limited broadcast (255.255.255.255) is dropped by a lot of Windows
 		// network stacks and consumer routers. Subnet-directed broadcast is far
 		// more reliable, so send one for every subnet we already know about.
 		for (const base of this.knownSubnets) {
-			this.socket.write(packet, `${base}.255`, LIFX_PORT);
+			this.writeListener(packet, `${base}.255`);
 		}
 
 		// Re-poke anything already in the cache so it refreshes its label/IP.
 		for (const [, cachedValue] of Array.from(this.cache.Entries())) {
 			if (cachedValue && isIpv4(cachedValue.ip)) {
-				this.socket.write(packet, cachedValue.ip, LIFX_PORT);
+				this.writeListener(packet, cachedValue.ip);
 			}
 		}
 	};
@@ -492,17 +581,22 @@ export function DiscoveryService() {
 		this.startSocket();
 		this.knownSubnets.add(prefix);
 
-		const packet = buildGetService();
 		service.log(`Sweeping ${prefix}.1-254 for LIFX lights.`);
 
-		this.socket.write(packet, `${prefix}.255`, LIFX_PORT);
+		// One directed broadcast up front - it often works on its own and costs
+		// a single packet - then queue the addresses for the drip-feed.
+		this.writeListener(buildGetService(), `${prefix}.255`);
+
 		for (let host = 1; host <= 254; host++) {
-			this.socket.write(packet, `${prefix}.${host}`, LIFX_PORT);
+			sweepQueue.push(`${prefix}.${host}`);
 		}
 	};
 
 	this.sweepSubnet = function(base) {
 		const raw = String(base || "").trim().replace(/\.$/, "");
+
+		// Drop anything still queued so repeated presses don't pile up.
+		sweepQueue = [];
 
 		// No text typed: sweep whatever subnets we already know about. With a
 		// light already linked that is always the right answer, so the button
@@ -549,10 +643,9 @@ export function DiscoveryService() {
 			return;
 		}
 
-		this.startSocket();
 		this.rememberSubnet(raw);
 		service.log(`Checking LIFX device at ${raw}.`);
-		this.socket.write(buildGetService(), raw, LIFX_PORT);
+		this.writeListener(buildGetService(), raw);
 	};
 
 	this.Discovered = function(value) {
@@ -594,8 +687,8 @@ export function DiscoveryService() {
 				paired: existing.paired === true,
 			};
 			this.upsertController(data);
-			this.socket.write(buildGetLabel(), ip, LIFX_PORT);
-			this.socket.write(buildGetVersion(), ip, LIFX_PORT);
+			this.writeListener(buildGetLabel(), ip);
+			this.writeListener(buildGetVersion(), ip);
 			return;
 		}
 
