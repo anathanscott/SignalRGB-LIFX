@@ -440,6 +440,10 @@ export function DiscoveryService() {
 			this.loadCachedDevices();
 			this.firstRun = false;
 			this.scanNow();
+			// Broadcast is unreliable on machines with a VPN or virtual adapter,
+			// so do one unicast sweep of every known subnet at startup. Unicast
+			// routes per-packet and reaches lights broadcast never finds.
+			this.sweepSubnet("");
 			return;
 		}
 		if (Date.now() - this.lastPollTime >= this.PollInterval) {
@@ -471,15 +475,22 @@ export function DiscoveryService() {
 		}
 	};
 
-	this.sweepSubnet = function(base) {
-		const prefix = subnetBase(`${base}.1`) || subnetBase(base);
-		if (!prefix) {
-			service.log(`Cannot sweep "${base}" - expected something like 192.168.0`);
-			return;
+	// Every subnet we have any evidence for: ones we've seen replies from, plus
+	// anything sitting in the cache from a previous session.
+	this.collectKnownSubnets = function() {
+		const found = new Set(this.knownSubnets);
+		for (const [, cachedValue] of Array.from(this.cache.Entries())) {
+			const base = cachedValue ? subnetBase(cachedValue.ip) : undefined;
+			if (base) {
+				found.add(base);
+			}
 		}
+		return Array.from(found);
+	};
 
+	this.sweepPrefix = function(prefix) {
 		this.startSocket();
-		this.rememberSubnet(`${prefix}.1`);
+		this.knownSubnets.add(prefix);
 
 		const packet = buildGetService();
 		service.log(`Sweeping ${prefix}.1-254 for LIFX lights.`);
@@ -488,6 +499,33 @@ export function DiscoveryService() {
 		for (let host = 1; host <= 254; host++) {
 			this.socket.write(packet, `${prefix}.${host}`, LIFX_PORT);
 		}
+	};
+
+	this.sweepSubnet = function(base) {
+		const raw = String(base || "").trim().replace(/\.$/, "");
+
+		// No text typed: sweep whatever subnets we already know about. With a
+		// light already linked that is always the right answer, so the button
+		// works on its own.
+		if (!raw) {
+			const targets = this.collectKnownSubnets();
+			if (!targets.length) {
+				service.log("Nothing to sweep yet - type a subnet like 192.168.0 and press Sweep Subnet.");
+				return;
+			}
+			for (const prefix of targets) {
+				this.sweepPrefix(prefix);
+			}
+			return;
+		}
+
+		const prefix = subnetBase(`${raw}.1`) || subnetBase(raw);
+		if (!prefix) {
+			service.log(`Cannot sweep "${raw}" - expected something like 192.168.0`);
+			return;
+		}
+
+		this.sweepPrefix(prefix);
 	};
 
 	this.rememberSubnet = function(ipAddress) {
