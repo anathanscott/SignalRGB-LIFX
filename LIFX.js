@@ -1,7 +1,7 @@
 import udp from "@SignalRGB/udp";
 
 export function Name() { return "LIFX"; }
-export function Version() { return "0.1.2"; }
+export function Version() { return "0.1.3-ans"; }
 export function Type() { return "network"; }
 export function DeviceType() { return "wifi"; }
 export function Publisher() { return "BigChiefRick"; }
@@ -11,6 +11,7 @@ export function DefaultScale() { return 8.0; }
 
 /* global
 controller:readonly
+discovery:readonly
 LightingMode:readonly
 forcedColor:readonly
 transitionMs:readonly
@@ -67,6 +68,7 @@ export function Initialize() {
 
 	deviceSocket = udp.createSocket();
 	deviceSocketReady = false;
+
 	deviceSocket.on("connection", function() {
 		deviceSocketReady = true;
 		device.log(`LIFX UDP connected to ${controller.ip}:${LIFX_PORT}.`);
@@ -74,9 +76,11 @@ export function Initialize() {
 			sendToController(buildSetPower(true, 0));
 		}
 	});
+
 	deviceSocket.on("error", function(code, message) {
 		logSocketError(code, message);
 	});
+
 	deviceSocket.connect(controller.ip, LIFX_PORT);
 
 	lastColorSignature = "";
@@ -98,8 +102,8 @@ export function Render() {
 	const rgb = LightingMode === "Forced"
 		? device.createColorArray(forcedColor, 1, "Inline").slice(0, 3)
 		: device.color(0, 0);
-	const signature = `${rgb[0]},${rgb[1]},${rgb[2]},${transitionMs}`;
 
+	const signature = `${rgb[0]},${rgb[1]},${rgb[2]},${transitionMs}`;
 	if (signature !== lastColorSignature || now - lastColorSentAt >= COLOR_REASSERT_MS) {
 		sendToController(buildSetColor(rgb, Number(transitionMs), DEFAULT_KELVIN));
 		lastColorSignature = signature;
@@ -113,7 +117,6 @@ export function Shutdown() {
 	if (turnOffOnShutdown && deviceSocketReady) {
 		sendToController(buildSetPower(false, 0));
 	}
-
 	if (deviceSocket) {
 		deviceSocket.close();
 		deviceSocket = undefined;
@@ -125,7 +128,6 @@ function sendToController(packet) {
 	if (!deviceSocket || !deviceSocketReady) {
 		return;
 	}
-
 	try {
 		deviceSocket.send(packet);
 	} catch (error) {
@@ -138,7 +140,6 @@ function logSocketError(code, message) {
 	if (now - lastSocketErrorAt < 5000) {
 		return;
 	}
-
 	lastSocketErrorAt = now;
 	device.log(`LIFX UDP error: ${code}${message ? ` - ${message}` : ""}`);
 }
@@ -175,7 +176,6 @@ function normalizeTarget(target) {
 	if (Array.isArray(target)) {
 		return target.slice(0, 8).concat(new Array(Math.max(0, 8 - target.length)).fill(0));
 	}
-
 	if (typeof target === "string") {
 		const hex = target.replace(/[^a-fA-F0-9]/g, "").slice(0, 12);
 		if (hex.length === 12) {
@@ -186,7 +186,6 @@ function normalizeTarget(target) {
 			return bytes.concat([0, 0]);
 		}
 	}
-
 	return new Array(8).fill(0);
 }
 
@@ -199,6 +198,7 @@ function targetId(target) {
 function buildPacket(type, target, payload, tagged, responseRequired) {
 	const body = payload || [];
 	const bytes = new Array(HEADER_SIZE + body.length).fill(0);
+
 	putUint16LE(bytes, 0, bytes.length);
 	putUint16LE(bytes, 2, 0x1400 | (tagged ? 0x2000 : 0));
 	putUint32LE(bytes, 4, SOURCE_ID);
@@ -242,11 +242,12 @@ function rgbToHsbk(rgb, kelvin) {
 	const red = Math.max(0, Math.min(255, Number(rgb[0]) || 0)) / 255;
 	const green = Math.max(0, Math.min(255, Number(rgb[1]) || 0)) / 255;
 	const blue = Math.max(0, Math.min(255, Number(rgb[2]) || 0)) / 255;
+
 	const maximum = Math.max(red, green, blue);
 	const minimum = Math.min(red, green, blue);
 	const delta = maximum - minimum;
-	let hue = 0;
 
+	let hue = 0;
 	if (delta !== 0) {
 		if (maximum === red) {
 			hue = 60 * (((green - blue) / delta) % 6);
@@ -256,7 +257,6 @@ function rgbToHsbk(rgb, kelvin) {
 			hue = 60 * (((red - green) / delta) + 4);
 		}
 	}
-
 	if (hue < 0) {
 		hue += 360;
 	}
@@ -288,7 +288,6 @@ function normalizeBytes(value) {
 	if (raw && raw.data !== undefined) {
 		raw = raw.data;
 	}
-
 	if (Array.isArray(raw)) {
 		return raw.map(function(byte) { return Number(byte) & 0xff; });
 	}
@@ -301,7 +300,6 @@ function normalizeBytes(value) {
 		}
 		return Array.from(raw).map(function(character) { return character.charCodeAt(0) & 0xff; });
 	}
-
 	return [];
 }
 
@@ -329,11 +327,11 @@ function readLabel(bytes) {
 	const labelBytes = bytes.slice(HEADER_SIZE, HEADER_SIZE + 32);
 	const zero = labelBytes.indexOf(0);
 	const content = zero >= 0 ? labelBytes.slice(0, zero) : labelBytes;
+
 	let encoded = "";
 	for (const byte of content) {
 		encoded += `%${byte.toString(16).padStart(2, "0")}`;
 	}
-
 	try {
 		return decodeURIComponent(encoded);
 	} catch (error) {
@@ -361,15 +359,42 @@ function remoteIp(value, fallback) {
 	if (value.remoteAddress && value.remoteAddress.address) {
 		return value.remoteAddress.address;
 	}
+	// Extra shapes seen across SignalRGB builds.
+	if (typeof value.remoteAddress === "string") {
+		return value.remoteAddress;
+	}
+	if (value.host && typeof value.host === "string") {
+		return value.host;
+	}
+	if (value.from && typeof value.from === "string") {
+		return value.from;
+	}
+	if (value.sender && typeof value.sender === "string") {
+		return value.sender;
+	}
 	return fallback;
+}
+
+function isIpv4(value) {
+	return /^((25[0-5]|2[0-4]\d|1?\d?\d)(\.|$)){4}$/.test(String(value || "").trim());
 }
 
 function controllerIdForIp(ipAddress) {
 	const ip = String(ipAddress || "").trim();
-	if (!/^((25[0-5]|2[0-4]\d|1?\d?\d)(\.|$)){4}$/.test(ip)) {
+	if (!isIpv4(ip)) {
 		return undefined;
 	}
 	return `lifx-${ip.replace(/\./g, "-")}`;
+}
+
+function subnetBase(ipAddress) {
+	const ip = String(ipAddress || "").trim();
+	const parts = ip.split(".");
+	if (parts.length < 3) {
+		return undefined;
+	}
+	const base = parts.slice(0, 3).join(".");
+	return isIpv4(`${base}.1`) ? base : undefined;
 }
 
 export function DiscoveryService() {
@@ -384,6 +409,12 @@ export function DiscoveryService() {
 	this.cache = new DeviceCache();
 	this.controllers = new Map();
 	this.announcedControllers = new Set();
+	this.knownSubnets = new Set();
+	this.unresolvedReplies = 0;
+
+	this.self = function() {
+		return (typeof discovery !== "undefined" && discovery) ? discovery : this;
+	};
 
 	this.Initialize = function() {
 		service.log("Initializing LIFX LAN discovery on UDP 56700.");
@@ -394,7 +425,6 @@ export function DiscoveryService() {
 		if (this.socket) {
 			return;
 		}
-
 		this.socket = udp.createSocket();
 		this.socket.on("message", function(message) {
 			discovery.handleIncoming(message);
@@ -412,7 +442,6 @@ export function DiscoveryService() {
 			this.scanNow();
 			return;
 		}
-
 		if (Date.now() - this.lastPollTime >= this.PollInterval) {
 			this.scanNow();
 		}
@@ -421,20 +450,71 @@ export function DiscoveryService() {
 	this.scanNow = function() {
 		this.startSocket();
 		this.lastPollTime = Date.now();
+
+		const packet = buildGetService();
+
 		service.log("Broadcasting LIFX GetService discovery packet.");
-		this.socket.write(buildGetService(), this.UdpBroadcastAddress, this.UdpBroadcastPort);
+		this.socket.write(packet, this.UdpBroadcastAddress, this.UdpBroadcastPort);
+
+		// Limited broadcast (255.255.255.255) is dropped by a lot of Windows
+		// network stacks and consumer routers. Subnet-directed broadcast is far
+		// more reliable, so send one for every subnet we already know about.
+		for (const base of this.knownSubnets) {
+			this.socket.write(packet, `${base}.255`, LIFX_PORT);
+		}
+
+		// Re-poke anything already in the cache so it refreshes its label/IP.
+		for (const [, cachedValue] of Array.from(this.cache.Entries())) {
+			if (cachedValue && isIpv4(cachedValue.ip)) {
+				this.socket.write(packet, cachedValue.ip, LIFX_PORT);
+			}
+		}
 	};
 
-	this.checkIP = function(ipAddress) {
-		const ip = String(ipAddress || "").trim();
-		if (!/^((25[0-5]|2[0-4]\d|1?\d?\d)(\.|$)){4}$/.test(ip)) {
-			service.log(`Ignoring invalid IPv4 address: ${ip}`);
+	this.sweepSubnet = function(base) {
+		const prefix = subnetBase(`${base}.1`) || subnetBase(base);
+		if (!prefix) {
+			service.log(`Cannot sweep "${base}" - expected something like 192.168.0`);
 			return;
 		}
 
 		this.startSocket();
-		service.log(`Checking LIFX device at ${ip}.`);
-		this.socket.write(buildGetService(), ip, LIFX_PORT);
+		this.rememberSubnet(`${prefix}.1`);
+
+		const packet = buildGetService();
+		service.log(`Sweeping ${prefix}.1-254 for LIFX lights.`);
+
+		this.socket.write(packet, `${prefix}.255`, LIFX_PORT);
+		for (let host = 1; host <= 254; host++) {
+			this.socket.write(packet, `${prefix}.${host}`, LIFX_PORT);
+		}
+	};
+
+	this.rememberSubnet = function(ipAddress) {
+		const base = subnetBase(ipAddress);
+		if (base) {
+			this.knownSubnets.add(base);
+		}
+	};
+
+	this.checkIP = function(ipAddress) {
+		const raw = String(ipAddress || "").trim();
+
+		// Accept a bare 3-octet prefix ("192.168.0") as a subnet sweep request.
+		if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.?$/.test(raw)) {
+			this.sweepSubnet(raw.replace(/\.$/, ""));
+			return;
+		}
+
+		if (!isIpv4(raw)) {
+			service.log(`Ignoring invalid address: "${raw}". Enter a full IP (192.168.0.50) or a subnet prefix (192.168.0) to sweep.`);
+			return;
+		}
+
+		this.startSocket();
+		this.rememberSubnet(raw);
+		service.log(`Checking LIFX device at ${raw}.`);
+		this.socket.write(buildGetService(), raw, LIFX_PORT);
 	};
 
 	this.Discovered = function(value) {
@@ -450,8 +530,16 @@ export function DiscoveryService() {
 		const ip = remoteIp(value);
 		const id = controllerIdForIp(ip);
 		if (!id) {
+			// Previously this dropped the reply in total silence, which made a
+			// light that answered look like a light that never existed.
+			this.unresolvedReplies++;
+			if (this.unresolvedReplies <= 5 || this.unresolvedReplies % 50 === 0) {
+				service.log(`Got a LIFX reply (type ${packet.type}) with no readable source IP - ignoring. Count: ${this.unresolvedReplies}.`);
+			}
 			return;
 		}
+
+		this.rememberSubnet(ip);
 
 		const existing = this.cache.Get(id) || {};
 		const controller = this.getController(id);
@@ -486,7 +574,11 @@ export function DiscoveryService() {
 		if (packet.type === MESSAGE.STATE_LABEL && packet.bytes.length >= 68) {
 			data.name = readLabel(packet.bytes) || data.name;
 		}
-		if (packet.type === MESSAGE.STATE_VERSION && packet.bytes.length >= 48) {
+
+		// StateVersion is 44 bytes on current firmware (vendor + product) and 48
+		// on older firmware that still sent the trailing version field. The old
+		// >= 48 test silently discarded every modern reply.
+		if (packet.type === MESSAGE.STATE_VERSION && packet.bytes.length >= 44) {
 			data.vendor = getUint32LE(packet.bytes, 36);
 			data.product = getUint32LE(packet.bytes, 40);
 			data.model = productName(data.product);
@@ -499,6 +591,20 @@ export function DiscoveryService() {
 		return this.controllers.get(id) || service.getController(id);
 	};
 
+	// QML hands these callbacks a plain id string. Older builds of this add-on
+	// passed the whole controller object across the QML/JS boundary, where it
+	// arrived as undefined - link() then threw on .id and remove() silently
+	// returned. Accept either shape so both paths work.
+	this.resolveId = function(value) {
+		if (typeof value === "string") {
+			return value;
+		}
+		if (value && typeof value.id === "string") {
+			return value.id;
+		}
+		return undefined;
+	};
+
 	this.upsertController = function(value) {
 		let controller = this.getController(value.id);
 		if (!controller) {
@@ -507,7 +613,6 @@ export function DiscoveryService() {
 		} else {
 			controller.updateWithValue(value);
 		}
-
 		this.controllers.set(value.id, controller);
 		this.cacheController(controller);
 		return controller;
@@ -538,6 +643,7 @@ export function DiscoveryService() {
 				value.id = migratedId;
 				value.port = LIFX_PORT;
 			}
+			this.rememberSubnet(value.ip);
 			const controller = this.upsertController(value);
 			this.announceOnce(controller);
 			if (value.ip) {
@@ -546,41 +652,65 @@ export function DiscoveryService() {
 		}
 	};
 
-	this.link = function(controllerObject) {
-		const controller = this.getController(controllerObject.id);
-		if (!controller) {
+	this.link = function(target) {
+		const self = this.self();
+		const id = self.resolveId(target);
+		if (!id) {
+			service.log("Link was called without a usable device id - ignoring.");
 			return;
 		}
+
+		const controller = self.getController(id);
+		if (!controller) {
+			service.log(`Link failed: no known device with id ${id}.`);
+			return;
+		}
+
 		controller.paired = true;
 		service.updateController(controller);
-		this.announceOnce(controller);
-		this.cacheController(controller);
+		self.announceOnce(controller);
+		self.cacheController(controller);
+		service.log(`Linked ${controller.name} at ${controller.ip}.`);
 	};
 
-	this.unlink = function(controllerObject) {
-		const controller = this.getController(controllerObject.id);
+	this.unlink = function(target) {
+		const self = this.self();
+		const id = self.resolveId(target);
+		if (!id) {
+			service.log("Unlink was called without a usable device id - ignoring.");
+			return;
+		}
+
+		const controller = self.getController(id);
 		if (!controller) {
 			return;
 		}
+
 		controller.paired = false;
 		service.updateController(controller);
 		service.suppressController(controller);
-		this.announcedControllers.delete(controller.id);
-		this.cacheController(controller);
+		self.announcedControllers.delete(controller.id);
+		self.cacheController(controller);
+		service.log(`Unlinked ${controller.name}.`);
 	};
 
-	this.remove = function(controllerObject) {
-		if (!controllerObject) {
+	this.remove = function(target) {
+		const self = this.self();
+		const id = self.resolveId(target);
+		if (!id) {
+			service.log("Remove was called without a usable device id - ignoring.");
 			return;
 		}
-		const controller = this.getController(controllerObject.id);
+
+		const controller = self.getController(id);
 		if (controller) {
 			service.suppressController(controller);
 			service.removeController(controller);
 		}
-		this.controllers.delete(controllerObject.id);
-		this.announcedControllers.delete(controllerObject.id);
-		this.cache.Remove(controllerObject.id);
+		self.controllers.delete(id);
+		self.announcedControllers.delete(id);
+		self.cache.Remove(id);
+		service.log(`Removed ${id}.`);
 	};
 
 	this.purgeCache = function() {
