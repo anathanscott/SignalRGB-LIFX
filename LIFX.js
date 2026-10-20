@@ -62,6 +62,8 @@ let sweepQueue = [];
 let discoveryFirstRun = true;
 let lastPollTime = 0;
 let lastDiscoveryErrorAt = 0;
+let seenResponders = new Set();
+let unparsedMessages = 0;
 
 export function ledNames() {
 	return ["Light"];
@@ -536,7 +538,8 @@ export function DiscoveryService() {
 		}
 
 		if (!sweepQueue.length) {
-			service.log("Subnet sweep finished.");
+			const heard = Array.from(seenResponders);
+			service.log(`Subnet sweep finished. Heard from ${heard.length} address(es) this session: ${heard.length ? heard.join(", ") : "none"}.`);
 		}
 	};
 
@@ -655,6 +658,13 @@ export function DiscoveryService() {
 	this.handleIncoming = function(value) {
 		const packet = parsePacket(value);
 		if (!packet) {
+			// Something arrived but did not look like LIFX. Worth knowing about:
+			// it means the socket can hear, which is a different problem from
+			// hearing nothing at all.
+			unparsedMessages++;
+			if (unparsedMessages <= 3 || unparsedMessages % 100 === 0) {
+				service.log(`Heard a datagram that did not parse as LIFX (${unparsedMessages} so far).`);
+			}
 			return;
 		}
 
@@ -671,6 +681,11 @@ export function DiscoveryService() {
 		}
 
 		this.rememberSubnet(ip);
+
+		if (!seenResponders.has(ip)) {
+			seenResponders.add(ip);
+			service.log(`Reply from ${ip} (message type ${packet.type}).`);
+		}
 
 		const existing = this.cache.Get(id) || {};
 		const controller = this.getController(id);
