@@ -35,7 +35,7 @@ Item {
 				Text {
 					Layout.fillWidth: true
 					color: theme.secondarytextcolor
-					text: "Lights are controlled locally over UDP 56700. Enter one light's IPv4 address and press Check IP, or enter just the first three numbers (for example 192.168.0) and press Sweep Subnet to find every light on your network."
+					text: "Lights are controlled locally over UDP 56700. Enter one or more IPv4 addresses, comma separated, and press Check IP - addresses from your router's device list work well. Or enter just the first three numbers (for example 192.168.0) and press Sweep Subnet."
 					wrapMode: Text.WordWrap
 					font.family: theme.secondaryfont
 					font.pixelSize: 13
@@ -49,11 +49,13 @@ Item {
 						id: manualIp
 						Layout.preferredWidth: 220
 						Layout.preferredHeight: 40
-						placeholderText: "192.168.0.50 or 192.168.0"
+						placeholderText: "192.168.0.50, .51  or  192.168.0"
 						color: theme.secondarytextcolor
 						font.family: theme.secondaryfont
+						// Digits, dots, commas and spaces: one address, a pasted
+						// list of them, or a bare subnet prefix to sweep.
 						validator: RegularExpressionValidator {
-							regularExpression: /^((25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])(\.|$)){0,4}$/
+							regularExpression: /^[0-9., ]{0,255}$/
 						}
 						background: Rectangle {
 							color: theme.background3
